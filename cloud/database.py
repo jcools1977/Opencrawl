@@ -45,9 +45,18 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
 
+    def _ensure_connection(self):
+        """Reconnect if the Postgres connection has dropped."""
+        if self._pg:
+            try:
+                self._conn.execute("SELECT 1")
+            except Exception:
+                self._connect()
+
     def _cursor(self):
         if self._pg:
             import psycopg2.extras
+            self._ensure_connection()
             return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         return self._conn.cursor()
 
