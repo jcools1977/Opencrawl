@@ -801,7 +801,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
         <h2>Stop Leaving Money on the Table</h2>
         <p>Every conversation your bot has is a financial instrument.<br>ConvoYield helps you maximize its yield.</p>
         <div style="display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;">
-            <a href="#" class="btn btn-primary">pip install convoyield &rarr;</a>
+            <a href="javascript:void(0)" class="btn btn-primary" onclick="copyPip(this)">pip install convoyield &rarr;</a>
             <a href="/dashboard" class="btn btn-outline">Open Dashboard</a>
         </div>
     </div>
@@ -816,6 +816,14 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
 
 <script>
     const API_BASE = window.location.origin;
+
+    function copyPip(el) {
+        navigator.clipboard.writeText('pip install convoyield').then(() => {
+            const orig = el.innerHTML;
+            el.innerHTML = 'Copied to clipboard!';
+            setTimeout(() => { el.innerHTML = orig; }, 2000);
+        });
+    }
 
     async function subscribeToPlan(productId) {
         // Get or create API key

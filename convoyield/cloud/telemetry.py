@@ -46,7 +46,7 @@ class Telemetry:
     def __init__(
         self,
         api_key: str,
-        server_url: str = "http://localhost:8000",
+        server_url: str = "https://convoyield-293458039498.us-central1.run.app",
         enabled: bool = True,
         flush_interval: float = 5.0,
         max_queue_size: int = 1000,
