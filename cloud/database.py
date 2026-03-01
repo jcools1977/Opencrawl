@@ -71,6 +71,7 @@ class Database:
         else:
             self._create_tables_sqlite()
         self._migrate_stripe_columns()
+        self._migrate_team_members()
 
     def _create_tables_sqlite(self):
         self._conn.executescript("""
@@ -261,6 +262,39 @@ class Database:
                     product_id TEXT NOT NULL,
                     status TEXT DEFAULT 'active',
                     current_period_end TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                )
+            """)
+            self._conn.commit()
+        cur.close()
+
+    def _migrate_team_members(self):
+        """Add team_members table (safe for re-runs)."""
+        cur = self._cursor()
+        if self._pg:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS team_members (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL REFERENCES accounts(id),
+                    email TEXT NOT NULL,
+                    role TEXT DEFAULT 'member',
+                    api_key TEXT UNIQUE NOT NULL,
+                    invited_by TEXT,
+                    status TEXT DEFAULT 'active',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS team_members (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    role TEXT DEFAULT 'member',
+                    api_key TEXT UNIQUE NOT NULL,
+                    invited_by TEXT,
+                    status TEXT DEFAULT 'active',
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (account_id) REFERENCES accounts(id)
                 )
@@ -648,6 +682,127 @@ class Database:
         if not self._pg:
             self._conn.commit()
         cur.close()
+
+    # ── Webhook Queries ─────────────────────────────────────────────────
+
+    def get_active_webhooks(self, account_id: str) -> list[dict]:
+        cur = self._cursor()
+        p = "%s" if self._pg else "?"
+        active_val = "TRUE" if self._pg else "1"
+        cur.execute(
+            f"SELECT * FROM webhooks WHERE account_id = {p} AND active = {active_val}",
+            (account_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [self._row_to_dict(r) for r in rows]
+
+    # ── Admin Queries ────────────────────────────────────────────────────
+
+    def get_admin_stats(self) -> dict:
+        cur = self._cursor()
+        p = "%s" if self._pg else "?"
+        # Total accounts
+        cur.execute("SELECT COUNT(*) as total FROM accounts")
+        total = self._row_to_dict(cur.fetchone())["total"]
+
+        # Tier breakdown
+        cur.execute("SELECT tier, COUNT(*) as count FROM accounts GROUP BY tier")
+        tiers = {self._row_to_dict(r)["tier"]: self._row_to_dict(r)["count"]
+                 for r in cur.fetchall()}
+
+        # MRR from active subscriptions
+        cur.execute("SELECT COUNT(*) as active_subs FROM subscriptions WHERE status = 'active'")
+        active_subs = self._row_to_dict(cur.fetchone())["active_subs"]
+
+        # Recent signups (7 days)
+        if self._pg:
+            cur.execute(
+                "SELECT COUNT(*) as recent FROM accounts WHERE created_at >= NOW() - INTERVAL '7 days'"
+            )
+        else:
+            cur.execute(
+                "SELECT COUNT(*) as recent FROM accounts WHERE created_at >= datetime('now', '-7 days')"
+            )
+        recent = self._row_to_dict(cur.fetchone())["recent"]
+
+        # Calculate MRR: pro=$49, enterprise=$299
+        mrr = tiers.get("pro", 0) * 49 + tiers.get("enterprise", 0) * 299
+
+        cur.close()
+        return {
+            "total_accounts": total,
+            "tier_breakdown": tiers,
+            "mrr": mrr,
+            "active_subscriptions": active_subs,
+            "recent_signups_7d": recent,
+        }
+
+    def get_all_accounts(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        cur = self._cursor()
+        p = "%s" if self._pg else "?"
+        cur.execute(
+            f"SELECT id, email, company, tier, created_at, stripe_customer_id "
+            f"FROM accounts ORDER BY created_at DESC LIMIT {p} OFFSET {p}",
+            (limit, offset),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [self._row_to_dict(r) for r in rows]
+
+    # ── Team Management ──────────────────────────────────────────────────
+
+    def create_team_member(self, member_id: str, account_id: str, email: str,
+                           role: str, api_key: str, invited_by: str) -> dict:
+        cur = self._cursor()
+        cur.execute(
+            f"INSERT INTO team_members (id, account_id, email, role, api_key, invited_by) "
+            f"VALUES ({self._ph(6)})",
+            (member_id, account_id, email, role, api_key, invited_by),
+        )
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+        return {"id": member_id, "email": email, "role": role, "api_key": api_key}
+
+    def get_team_members(self, account_id: str) -> list[dict]:
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT id, email, role, status, created_at FROM team_members "
+            f"WHERE account_id = {self._ph(1)} AND status = 'active'",
+            (account_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [self._row_to_dict(r) for r in rows]
+
+    def remove_team_member(self, member_id: str, account_id: str) -> bool:
+        cur = self._cursor()
+        cur.execute(
+            f"UPDATE team_members SET status = 'removed' "
+            f"WHERE id = {self._ph(1)} AND account_id = {self._ph(1)}",
+            (member_id, account_id),
+        )
+        affected = cur.rowcount
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+        return affected > 0
+
+    def get_account_by_team_key(self, api_key: str) -> Optional[dict]:
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT account_id FROM team_members "
+            f"WHERE api_key = {self._ph(1)} AND status = 'active'",
+            (api_key,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return None
+        account_id = self._row_to_dict(row)["account_id"]
+        cur.close()
+        return self.get_account_by_id(account_id)
 
     def close(self):
         self._conn.close()

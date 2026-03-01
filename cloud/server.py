@@ -24,18 +24,24 @@ from pathlib import Path
 from typing import Optional
 
 import stripe
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from cloud.database import Database
+from cloud.emails import (
+    send_welcome, send_subscription_receipt, send_cancellation_notice,
+)
+from cloud.webhook_delivery import check_and_fire_webhooks
+from convoyield.playbooks import ALL_PLAYBOOKS
 
 # ── Stripe Config ──────────────────────────────────────────────────────────────
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 STRIPE_PRICE_MAP = {
     "pro": os.environ.get("STRIPE_PRICE_PRO", ""),
@@ -58,6 +64,8 @@ app = FastAPI(
 )
 
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
+ADMIN_DIR = Path(__file__).parent / "admin"
+LANDING_DIR = Path(__file__).parent.parent / "landing"
 STATIC_DIR = Path(__file__).parent / "static"
 
 if STATIC_DIR.exists():
@@ -114,22 +122,55 @@ class ApiKeyRequest(BaseModel):
 # ── Authentication ────────────────────────────────────────────────────────────
 
 def _verify_api_key(api_key: str) -> dict:
-    """Verify an API key and return the associated account."""
+    """Verify an API key and return the associated account. Falls back to team member keys."""
     account = db.get_account_by_key(api_key)
-    if not account:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return account
+    if account:
+        return account
+    # Fallback: check team member keys
+    account = db.get_account_by_team_key(api_key)
+    if account:
+        return account
+    raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ── Dashboard Routes ──────────────────────────────────────────────────────────
+def _verify_admin(password: str):
+    """Verify admin password from X-Admin-Password header."""
+    if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+
+
+# ── Page Routes ───────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
+async def landing_page():
+    """Serve the landing page (convoyield.com root)."""
+    landing_file = LANDING_DIR / "index.html"
+    if landing_file.exists():
+        return HTMLResponse(content=landing_file.read_text())
+    return HTMLResponse(content="<h1>ConvoYield</h1><p>Turn every conversation into revenue.</p>")
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    """Serve the main analytics dashboard."""
+    """Serve the analytics dashboard."""
     dashboard_file = DASHBOARD_DIR / "index.html"
     if dashboard_file.exists():
         return HTMLResponse(content=dashboard_file.read_text())
     return HTMLResponse(content="<h1>ConvoYield Cloud</h1><p>Dashboard loading...</p>")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(password: str = ""):
+    """Serve the admin dashboard (password-protected)."""
+    if not ADMIN_PASSWORD or password != ADMIN_PASSWORD:
+        return HTMLResponse(
+            content="<h1>Unauthorized</h1><p>Append ?password=YOUR_PASSWORD to the URL.</p>",
+            status_code=401,
+        )
+    admin_file = ADMIN_DIR / "index.html"
+    if admin_file.exists():
+        return HTMLResponse(content=admin_file.read_text())
+    return HTMLResponse(content="<h1>Admin</h1><p>Admin dashboard loading...</p>")
 
 
 # ── API Key Management ────────────────────────────────────────────────────────
@@ -148,6 +189,8 @@ async def create_api_key(request: ApiKeyRequest):
         api_key=api_key,
     )
 
+    send_welcome(request.email, api_key, request.tier)
+
     return {
         "api_key": api_key,
         "account_id": account_id,
@@ -161,6 +204,7 @@ async def create_api_key(request: ApiKeyRequest):
 @app.post("/api/v1/events/yield")
 async def ingest_yield_event(
     event: YieldEvent,
+    background_tasks: BackgroundTasks,
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
     """
@@ -192,6 +236,17 @@ async def ingest_yield_event(
         micro_conversion_types=json.dumps(event.micro_conversion_types),
         user_message_length=event.user_message_length,
     )
+
+    # Fire webhooks in background
+    event_data = {
+        "session_id": event.session_id,
+        "estimated_yield": event.estimated_yield,
+        "risk_level": event.risk_level,
+        "arbitrage_types": json.dumps(event.arbitrage_types),
+        "phase": event.phase,
+        "turn_number": event.turn_number,
+    }
+    background_tasks.add_task(check_and_fire_webhooks, db, account["id"], event_data)
 
     return {"status": "ok", "event_id": str(uuid.uuid4())}
 
@@ -581,6 +636,11 @@ def _handle_checkout_completed(session: dict):
     else:
         db.activate_playbook(account_id, product_id)
 
+    # Send receipt email
+    account = db.get_account_by_id(account_id)
+    if account:
+        send_subscription_receipt(account["email"], product_id, product_type or "tier")
+
 
 def _handle_subscription_updated(subscription: dict):
     status = subscription.get("status", "")
@@ -609,6 +669,14 @@ def _cancel_subscription(subscription: dict):
     account = db.get_account_by_stripe_customer(stripe_cust_id)
     if not account:
         return
+
+    # Send cancellation email
+    subs_for_email = db.get_active_subscriptions(account["id"])
+    canceled_sub = next(
+        (s for s in subs_for_email if s.get("stripe_subscription_id") == stripe_sub_id), None
+    )
+    if canceled_sub:
+        send_cancellation_notice(account["email"], canceled_sub["product_id"])
 
     # Check what product this subscription was for
     subs = db.get_active_subscriptions(account["id"])
@@ -695,6 +763,115 @@ async def create_webhook(
     )
 
     return {"webhook_id": webhook_id, "status": "active"}
+
+
+# ── Playbook Content Delivery ─────────────────────────────────────────────────
+
+@app.get("/api/v1/playbooks/{playbook_id}/content")
+async def get_playbook_content(
+    playbook_id: str,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Return the actual plays JSON for a purchased/enterprise playbook."""
+    account = _verify_api_key(x_api_key)
+
+    if playbook_id not in ALL_PLAYBOOKS:
+        raise HTTPException(status_code=404, detail=f"Playbook '{playbook_id}' not found")
+
+    # Enterprise gets all playbooks
+    if account.get("tier") == "enterprise":
+        return {"playbook_id": playbook_id, "plays": ALL_PLAYBOOKS[playbook_id]}
+
+    # Check active subscription
+    subs = db.get_active_subscriptions(account["id"])
+    has_sub = any(s["product_id"] == playbook_id and s["status"] == "active" for s in subs)
+    if not has_sub:
+        raise HTTPException(
+            status_code=402,
+            detail="Active subscription required. Purchase via /api/v1/billing/checkout.",
+        )
+
+    return {"playbook_id": playbook_id, "plays": ALL_PLAYBOOKS[playbook_id]}
+
+
+# ── Admin API ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/admin/stats")
+async def admin_stats(
+    x_admin_password: str = Header(..., alias="X-Admin-Password"),
+):
+    """Get platform-wide admin statistics."""
+    _verify_admin(x_admin_password)
+    return db.get_admin_stats()
+
+
+@app.get("/api/v1/admin/accounts")
+async def admin_accounts(
+    x_admin_password: str = Header(..., alias="X-Admin-Password"),
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Get paginated list of all accounts."""
+    _verify_admin(x_admin_password)
+    return {"accounts": db.get_all_accounts(limit, offset)}
+
+
+# ── Team Management ──────────────────────────────────────────────────────────
+
+class TeamInviteRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+
+@app.post("/api/v1/team/invite")
+async def invite_team_member(
+    body: TeamInviteRequest,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Invite a team member (enterprise only). Creates a sub-key."""
+    account = _verify_api_key(x_api_key)
+    if account.get("tier") != "enterprise":
+        raise HTTPException(status_code=403, detail="Team management requires Enterprise tier.")
+
+    member_id = str(uuid.uuid4())
+    member_key = f"cy_team_{secrets.token_urlsafe(24)}"
+
+    member = db.create_team_member(
+        member_id=member_id,
+        account_id=account["id"],
+        email=body.email,
+        role=body.role,
+        api_key=member_key,
+        invited_by=account.get("email", ""),
+    )
+
+    return {"member": member}
+
+
+@app.get("/api/v1/team")
+async def list_team_members(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """List team members for the account."""
+    account = _verify_api_key(x_api_key)
+    if account.get("tier") != "enterprise":
+        raise HTTPException(status_code=403, detail="Team management requires Enterprise tier.")
+    return {"members": db.get_team_members(account["id"])}
+
+
+@app.delete("/api/v1/team/{member_id}")
+async def remove_team_member_endpoint(
+    member_id: str,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Remove a team member."""
+    account = _verify_api_key(x_api_key)
+    if account.get("tier") != "enterprise":
+        raise HTTPException(status_code=403, detail="Team management requires Enterprise tier.")
+    removed = db.remove_team_member(member_id, account["id"])
+    if not removed:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    return {"status": "removed", "member_id": member_id}
 
 
 # ── Health & Status ───────────────────────────────────────────────────────────

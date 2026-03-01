@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ConvoYield Admin</title>
+    <style>
+        :root {
+            --bg: #0a0e17;
+            --bg2: #111827;
+            --card: #1a2332;
+            --green: #10b981;
+            --cyan: #06b6d4;
+            --blue: #3b82f6;
+            --purple: #8b5cf6;
+            --yellow: #f59e0b;
+            --red: #ef4444;
+            --text: #f1f5f9;
+            --text2: #94a3b8;
+            --dim: #64748b;
+            --border: #1e293b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 32px;
+            background: var(--bg2);
+            border-bottom: 1px solid var(--border);
+        }
+        .topbar h1 {
+            font-size: 18px;
+            background: linear-gradient(135deg, var(--red), var(--yellow));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .topbar .tag {
+            font-size: 11px;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--red);
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 32px; }
+
+        /* KPI Cards */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 32px;
+        }
+        .kpi-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .kpi-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--dim);
+            margin-bottom: 8px;
+        }
+        .kpi-value {
+            font-size: 32px;
+            font-weight: 800;
+        }
+        .kpi-value.green { color: var(--green); }
+        .kpi-value.cyan { color: var(--cyan); }
+        .kpi-value.yellow { color: var(--yellow); }
+        .kpi-value.purple { color: var(--purple); }
+
+        /* Tier Breakdown */
+        .section-title {
+            font-size: 16px;
+            margin-bottom: 16px;
+            color: var(--text2);
+        }
+        .tier-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+        .tier-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        .tier-card .tier-name {
+            font-size: 13px;
+            color: var(--dim);
+            margin-bottom: 4px;
+        }
+        .tier-card .tier-count {
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        /* Accounts Table */
+        .table-wrap {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--dim);
+            background: var(--bg2);
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 12px 16px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text2);
+        }
+        tr:last-child td { border-bottom: none; }
+        .tier-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .tier-free { background: rgba(100,116,139,0.2); color: var(--dim); }
+        .tier-pro { background: rgba(16,185,129,0.15); color: var(--green); }
+        .tier-enterprise { background: rgba(139,92,246,0.15); color: var(--purple); }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            padding: 16px;
+        }
+        .pagination button {
+            padding: 8px 20px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg2);
+            color: var(--text);
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .pagination button:hover { border-color: var(--green); }
+        .pagination button:disabled { opacity: 0.3; cursor: default; }
+
+        .loading { text-align: center; padding: 40px; color: var(--dim); }
+        .error { color: var(--red); text-align: center; padding: 40px; }
+
+        @media (max-width: 900px) {
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .tier-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <h1>ConvoYield Admin</h1>
+    <span class="tag">ADMIN</span>
+</div>
+
+<div class="container">
+    <div id="content" class="loading">Loading admin data...</div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+const params = new URLSearchParams(window.location.search);
+const PASSWORD = params.get('password') || '';
+let currentOffset = 0;
+const PAGE_SIZE = 25;
+
+async function fetchStats() {
+    const res = await fetch(`${API_BASE}/api/v1/admin/stats`, {
+        headers: { 'X-Admin-Password': PASSWORD }
+    });
+    if (!res.ok) throw new Error('Unauthorized');
+    return res.json();
+}
+
+async function fetchAccounts(offset = 0) {
+    const res = await fetch(`${API_BASE}/api/v1/admin/accounts?limit=${PAGE_SIZE}&offset=${offset}`, {
+        headers: { 'X-Admin-Password': PASSWORD }
+    });
+    if (!res.ok) throw new Error('Failed to fetch accounts');
+    return res.json();
+}
+
+function tierBadge(tier) {
+    const cls = tier === 'enterprise' ? 'tier-enterprise' : tier === 'pro' ? 'tier-pro' : 'tier-free';
+    return `<span class="tier-badge ${cls}">${tier}</span>`;
+}
+
+async function render() {
+    const el = document.getElementById('content');
+    try {
+        const [stats, accountsData] = await Promise.all([fetchStats(), fetchAccounts(currentOffset)]);
+        const accounts = accountsData.accounts || [];
+        const tb = stats.tier_breakdown || {};
+
+        el.innerHTML = `
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Accounts</div>
+                    <div class="kpi-value cyan">${stats.total_accounts}</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Monthly Recurring Revenue</div>
+                    <div class="kpi-value green">$${stats.mrr.toLocaleString()}</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Active Subscriptions</div>
+                    <div class="kpi-value yellow">${stats.active_subscriptions}</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Signups (7d)</div>
+                    <div class="kpi-value purple">${stats.recent_signups_7d}</div>
+                </div>
+            </div>
+
+            <div class="section-title">Tier Breakdown</div>
+            <div class="tier-grid">
+                <div class="tier-card">
+                    <div class="tier-name">Free</div>
+                    <div class="tier-count" style="color:var(--dim)">${tb.free || 0}</div>
+                </div>
+                <div class="tier-card">
+                    <div class="tier-name">Pro</div>
+                    <div class="tier-count" style="color:var(--green)">${tb.pro || 0}</div>
+                </div>
+                <div class="tier-card">
+                    <div class="tier-name">Enterprise</div>
+                    <div class="tier-count" style="color:var(--purple)">${tb.enterprise || 0}</div>
+                </div>
+            </div>
+
+            <div class="section-title">All Accounts</div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Email</th>
+                            <th>Company</th>
+                            <th>Tier</th>
+                            <th>Stripe</th>
+                            <th>Created</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${accounts.map(a => `
+                            <tr>
+                                <td style="color:var(--text)">${a.email}</td>
+                                <td>${a.company || '-'}</td>
+                                <td>${tierBadge(a.tier)}</td>
+                                <td>${a.stripe_customer_id ? 'Yes' : '-'}</td>
+                                <td>${a.created_at ? new Date(a.created_at).toLocaleDateString() : '-'}</td>
+                            </tr>
+                        `).join('')}
+                        ${accounts.length === 0 ? '<tr><td colspan="5" style="text-align:center;padding:24px;">No accounts yet</td></tr>' : ''}
+                    </tbody>
+                </table>
+                <div class="pagination">
+                    <button onclick="prevPage()" ${currentOffset === 0 ? 'disabled' : ''}>Previous</button>
+                    <button onclick="nextPage()" ${accounts.length < PAGE_SIZE ? 'disabled' : ''}>Next</button>
+                </div>
+            </div>
+        `;
+    } catch (e) {
+        el.innerHTML = `<div class="error">Error: ${e.message}</div>`;
+    }
+}
+
+function nextPage() {
+    currentOffset += PAGE_SIZE;
+    render();
+}
+function prevPage() {
+    currentOffset = Math.max(0, currentOffset - PAGE_SIZE);
+    render();
+}
+
+render();
+</script>
+</body>
+</html>

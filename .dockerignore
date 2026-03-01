@@ -6,7 +6,6 @@ __pycache__
 *.egg-info
 tests/
 examples/
-landing/
 *.md
 !README.md
 .env

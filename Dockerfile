@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements-cloud.txt
 # Copy application code
 COPY convoyield/ convoyield/
 COPY cloud/ cloud/
+COPY landing/ landing/
 COPY pyproject.toml .
 
 # Install the package itself (for imports)
