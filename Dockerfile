@@ -24,4 +24,4 @@ ENV PORT=8080
 
 EXPOSE ${PORT}
 
-CMD ["python", "-c", "from cloud.server import main; main()"]
+CMD uvicorn cloud.server:app --host 0.0.0.0 --port ${PORT}

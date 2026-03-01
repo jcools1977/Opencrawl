@@ -41,7 +41,7 @@ app = FastAPI(
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
 STATIC_DIR = Path(__file__).parent / "static"
 
-if DASHBOARD_DIR.exists():
+if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 db = Database()
