@@ -70,6 +70,7 @@ class Database:
             self._create_tables_pg()
         else:
             self._create_tables_sqlite()
+        self._migrate_stripe_columns()
 
     def _create_tables_sqlite(self):
         self._conn.executescript("""
@@ -225,6 +226,48 @@ class Database:
             cur.execute(idx_sql)
         cur.close()
 
+    def _migrate_stripe_columns(self):
+        """Add Stripe-related columns and subscriptions table (safe for re-runs)."""
+        cur = self._cursor()
+        # Add stripe columns to accounts
+        for col in ["stripe_customer_id TEXT", "stripe_subscription_id TEXT"]:
+            try:
+                cur.execute(f"ALTER TABLE accounts ADD COLUMN {col}")
+            except Exception:
+                pass  # Column already exists
+        # Create subscriptions table
+        if self._pg:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL REFERENCES accounts(id),
+                    stripe_subscription_id TEXT,
+                    stripe_customer_id TEXT,
+                    product_type TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    current_period_end TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    stripe_subscription_id TEXT,
+                    stripe_customer_id TEXT,
+                    product_type TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    current_period_end TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                )
+            """)
+            self._conn.commit()
+        cur.close()
+
     # ── Account Management ────────────────────────────────────────────────
 
     def create_account(self, account_id: str, email: str, company: Optional[str],
@@ -258,6 +301,103 @@ class Database:
             playbooks = json.loads(raw)
             if playbook_id not in playbooks:
                 playbooks.append(playbook_id)
+            cur.execute(
+                f"UPDATE accounts SET active_playbooks = {self._ph(1)} WHERE id = {self._ph(1)}",
+                (json.dumps(playbooks), account_id),
+            )
+            if not self._pg:
+                self._conn.commit()
+        cur.close()
+
+    def update_account_stripe(self, account_id: str, stripe_customer_id: str,
+                              stripe_subscription_id: Optional[str] = None):
+        cur = self._cursor()
+        cur.execute(
+            f"UPDATE accounts SET stripe_customer_id = {self._ph(1)}, "
+            f"stripe_subscription_id = {self._ph(1)} WHERE id = {self._ph(1)}",
+            (stripe_customer_id, stripe_subscription_id, account_id),
+        )
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+
+    def update_account_tier(self, account_id: str, tier: str):
+        cur = self._cursor()
+        cur.execute(
+            f"UPDATE accounts SET tier = {self._ph(1)} WHERE id = {self._ph(1)}",
+            (tier, account_id),
+        )
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+
+    def get_account_by_id(self, account_id: str) -> Optional[dict]:
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT * FROM accounts WHERE id = {self._ph(1)}", (account_id,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        return self._row_to_dict(row)
+
+    def get_account_by_stripe_customer(self, stripe_customer_id: str) -> Optional[dict]:
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT * FROM accounts WHERE stripe_customer_id = {self._ph(1)}",
+            (stripe_customer_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return self._row_to_dict(row)
+
+    def create_subscription(self, sub_id: str, account_id: str,
+                            stripe_subscription_id: str, stripe_customer_id: str,
+                            product_type: str, product_id: str,
+                            current_period_end: Optional[str] = None):
+        cur = self._cursor()
+        cur.execute(
+            f"INSERT INTO subscriptions (id, account_id, stripe_subscription_id, "
+            f"stripe_customer_id, product_type, product_id, status, current_period_end) "
+            f"VALUES ({self._ph(8)})",
+            (sub_id, account_id, stripe_subscription_id, stripe_customer_id,
+             product_type, product_id, "active", current_period_end),
+        )
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+
+    def update_subscription_status(self, stripe_subscription_id: str, status: str):
+        cur = self._cursor()
+        cur.execute(
+            f"UPDATE subscriptions SET status = {self._ph(1)} "
+            f"WHERE stripe_subscription_id = {self._ph(1)}",
+            (status, stripe_subscription_id),
+        )
+        if not self._pg:
+            self._conn.commit()
+        cur.close()
+
+    def get_active_subscriptions(self, account_id: str) -> list[dict]:
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT * FROM subscriptions WHERE account_id = {self._ph(1)} AND status = 'active'",
+            (account_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [self._row_to_dict(r) for r in rows]
+
+    def deactivate_playbook(self, account_id: str, playbook_id: str):
+        cur = self._cursor()
+        cur.execute(
+            f"SELECT active_playbooks FROM accounts WHERE id = {self._ph(1)}", (account_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            raw = self._row_to_dict(row)["active_playbooks"]
+            playbooks = json.loads(raw)
+            if playbook_id in playbooks:
+                playbooks.remove(playbook_id)
             cur.execute(
                 f"UPDATE accounts SET active_playbooks = {self._ph(1)} WHERE id = {self._ph(1)}",
                 (json.dumps(playbooks), account_id),

@@ -23,12 +23,31 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import stripe
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from cloud.database import Database
+
+# ── Stripe Config ──────────────────────────────────────────────────────────────
+
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+
+STRIPE_PRICE_MAP = {
+    "pro": os.environ.get("STRIPE_PRICE_PRO", ""),
+    "enterprise": os.environ.get("STRIPE_PRICE_ENTERPRISE", ""),
+    "saas_sales": os.environ.get("STRIPE_PRICE_SAAS_SALES", ""),
+    "ecommerce": os.environ.get("STRIPE_PRICE_ECOMMERCE", ""),
+    "real_estate": os.environ.get("STRIPE_PRICE_REAL_ESTATE", ""),
+    "healthcare": os.environ.get("STRIPE_PRICE_HEALTHCARE", ""),
+}
+
+TIER_PRODUCTS = {"pro", "enterprise"}
+PLAYBOOK_PRODUCTS = {"saas_sales", "ecommerce", "real_estate", "healthcare"}
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 
@@ -381,17 +400,25 @@ async def activate_playbook(
     playbook_id: str,
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
-    """Activate a premium playbook for the account."""
+    """Activate a premium playbook for the account (requires active subscription)."""
     account = _verify_api_key(x_api_key)
 
-    # In production, this would verify Stripe payment
-    db.activate_playbook(account["id"], playbook_id)
+    # Enterprise gets all playbooks free
+    if account.get("tier") == "enterprise":
+        db.activate_playbook(account["id"], playbook_id)
+        return {"status": "activated", "playbook_id": playbook_id,
+                "message": "Playbook is now active. Import it in your ConvoYield engine."}
 
-    return {
-        "status": "activated",
-        "playbook_id": playbook_id,
-        "message": "Playbook is now active. Import it in your ConvoYield engine.",
-    }
+    # Otherwise require an active subscription for this playbook
+    subs = db.get_active_subscriptions(account["id"])
+    has_sub = any(s["product_id"] == playbook_id and s["status"] == "active" for s in subs)
+    if not has_sub:
+        raise HTTPException(status_code=402,
+                            detail="Active subscription required. Purchase via /api/v1/billing/checkout.")
+
+    db.activate_playbook(account["id"], playbook_id)
+    return {"status": "activated", "playbook_id": playbook_id,
+            "message": "Playbook is now active. Import it in your ConvoYield engine."}
 
 
 # ── Billing / Pricing ────────────────────────────────────────────────────────
@@ -455,6 +482,188 @@ async def pricing():
             },
         ]
     }
+
+
+# ── Stripe Billing ────────────────────────────────────────────────────────────
+
+class CheckoutRequest(BaseModel):
+    product_id: str  # "pro", "enterprise", "saas_sales", etc.
+
+
+@app.post("/api/v1/billing/checkout")
+async def billing_checkout(
+    body: CheckoutRequest,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Create a Stripe Checkout Session and return the redirect URL."""
+    account = _verify_api_key(x_api_key)
+    price_id = STRIPE_PRICE_MAP.get(body.product_id)
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"Unknown product: {body.product_id}")
+
+    # Get or create Stripe customer
+    customer_id = account.get("stripe_customer_id")
+    if not customer_id:
+        customer = stripe.Customer.create(
+            email=account["email"],
+            metadata={"account_id": account["id"]},
+        )
+        customer_id = customer.id
+        db.update_account_stripe(account["id"], customer_id)
+
+    product_type = "tier" if body.product_id in TIER_PRODUCTS else "playbook"
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{BASE_URL}/dashboard?checkout=success",
+        cancel_url=f"{BASE_URL}/dashboard?checkout=cancel",
+        metadata={
+            "account_id": account["id"],
+            "product_id": body.product_id,
+            "product_type": product_type,
+        },
+    )
+
+    return {"checkout_url": session.url, "session_id": session.id}
+
+
+@app.post("/api/v1/billing/webhook")
+async def billing_webhook(request: Request):
+    """Handle Stripe webhook events with signature verification."""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        _handle_checkout_completed(obj)
+    elif etype == "customer.subscription.updated":
+        _handle_subscription_updated(obj)
+    elif etype == "customer.subscription.deleted":
+        _handle_subscription_deleted(obj)
+    elif etype == "invoice.payment_failed":
+        _handle_payment_failed(obj)
+
+    return {"status": "ok"}
+
+
+def _handle_checkout_completed(session: dict):
+    meta = session.get("metadata", {})
+    account_id = meta.get("account_id")
+    product_id = meta.get("product_id")
+    product_type = meta.get("product_type")
+    stripe_sub_id = session.get("subscription")
+    stripe_cust_id = session.get("customer")
+
+    if not account_id or not product_id:
+        return
+
+    sub_id = str(uuid.uuid4())
+    db.create_subscription(
+        sub_id=sub_id,
+        account_id=account_id,
+        stripe_subscription_id=stripe_sub_id or "",
+        stripe_customer_id=stripe_cust_id or "",
+        product_type=product_type or "tier",
+        product_id=product_id,
+    )
+    db.update_account_stripe(account_id, stripe_cust_id or "", stripe_sub_id)
+
+    if product_type == "tier":
+        db.update_account_tier(account_id, product_id)
+    else:
+        db.activate_playbook(account_id, product_id)
+
+
+def _handle_subscription_updated(subscription: dict):
+    status = subscription.get("status", "")
+    stripe_sub_id = subscription.get("id", "")
+    if status in ("active", "past_due", "trialing"):
+        db.update_subscription_status(stripe_sub_id, status)
+    elif status in ("canceled", "unpaid"):
+        _cancel_subscription(subscription)
+
+
+def _handle_subscription_deleted(subscription: dict):
+    _cancel_subscription(subscription)
+
+
+def _handle_payment_failed(invoice: dict):
+    stripe_sub_id = invoice.get("subscription", "")
+    if stripe_sub_id:
+        db.update_subscription_status(stripe_sub_id, "past_due")
+
+
+def _cancel_subscription(subscription: dict):
+    stripe_sub_id = subscription.get("id", "")
+    stripe_cust_id = subscription.get("customer", "")
+    db.update_subscription_status(stripe_sub_id, "canceled")
+
+    account = db.get_account_by_stripe_customer(stripe_cust_id)
+    if not account:
+        return
+
+    # Check what product this subscription was for
+    subs = db.get_active_subscriptions(account["id"])
+    # If no active tier subscriptions remain, downgrade to free
+    has_tier = any(s["product_type"] == "tier" and s["status"] == "active"
+                   and s["stripe_subscription_id"] != stripe_sub_id for s in subs)
+    if not has_tier:
+        db.update_account_tier(account["id"], "free")
+
+    # Deactivate playbooks whose subscriptions are canceled
+    for s in subs:
+        if (s["stripe_subscription_id"] == stripe_sub_id
+                and s["product_type"] == "playbook"):
+            db.deactivate_playbook(account["id"], s["product_id"])
+
+
+@app.get("/api/v1/billing/info")
+async def billing_info(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Return current billing info: tier, subscriptions, Stripe customer."""
+    account = _verify_api_key(x_api_key)
+    subs = db.get_active_subscriptions(account["id"])
+
+    return {
+        "tier": account.get("tier", "free"),
+        "stripe_customer_id": account.get("stripe_customer_id"),
+        "active_subscriptions": len(subs),
+        "subscriptions": [
+            {
+                "product_type": s["product_type"],
+                "product_id": s["product_id"],
+                "status": s["status"],
+            }
+            for s in subs
+        ],
+    }
+
+
+@app.post("/api/v1/billing/portal")
+async def billing_portal(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Create a Stripe Billing Portal session for self-service management."""
+    account = _verify_api_key(x_api_key)
+    customer_id = account.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No billing account. Subscribe first.")
+
+    session = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=f"{BASE_URL}/dashboard",
+    )
+
+    return {"portal_url": session.url}
 
 
 # ── Webhook Management ────────────────────────────────────────────────────────

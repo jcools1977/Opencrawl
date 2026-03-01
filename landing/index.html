@@ -729,7 +729,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <li><span class="check">+</span> Email reports</li>
                     <li><span class="check">+</span> Priority support</li>
                 </ul>
-                <a href="#cta" class="btn btn-primary">Start Pro Trial</a>
+                <button class="btn btn-primary" onclick="subscribeToPlan('pro')">Get Pro</button>
             </div>
             <div class="price-card">
                 <h3>Enterprise</h3>
@@ -744,7 +744,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <li><span class="check">+</span> White-label option</li>
                     <li><span class="check">+</span> Dedicated support</li>
                 </ul>
-                <a href="#cta" class="btn btn-outline">Contact Sales</a>
+                <button class="btn btn-outline" onclick="subscribeToPlan('enterprise')">Get Enterprise</button>
             </div>
         </div>
     </div>
@@ -762,6 +762,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <span class="playbook-plays">25 plays</span>
                     <span class="playbook-price">$49/mo</span>
                 </div>
+                <button class="btn btn-outline" style="width:100%;justify-content:center;margin-top:12px;font-size:12px;" onclick="subscribeToPlan('saas_sales')">Subscribe</button>
             </div>
             <div class="playbook-card">
                 <h3>E-Commerce Revenue Max</h3>
@@ -770,6 +771,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <span class="playbook-plays">22 plays</span>
                     <span class="playbook-price">$39/mo</span>
                 </div>
+                <button class="btn btn-outline" style="width:100%;justify-content:center;margin-top:12px;font-size:12px;" onclick="subscribeToPlan('ecommerce')">Subscribe</button>
             </div>
             <div class="playbook-card">
                 <h3>Real Estate Closer</h3>
@@ -778,6 +780,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <span class="playbook-plays">20 plays</span>
                     <span class="playbook-price">$79/mo</span>
                 </div>
+                <button class="btn btn-outline" style="width:100%;justify-content:center;margin-top:12px;font-size:12px;" onclick="subscribeToPlan('real_estate')">Subscribe</button>
             </div>
             <div class="playbook-card">
                 <h3>Healthcare Engagement</h3>
@@ -786,6 +789,7 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
                     <span class="playbook-plays">18 plays</span>
                     <span class="playbook-price">$99/mo</span>
                 </div>
+                <button class="btn btn-outline" style="width:100%;justify-content:center;margin-top:12px;font-size:12px;" onclick="subscribeToPlan('healthcare')">Subscribe</button>
             </div>
         </div>
     </div>
@@ -810,5 +814,51 @@ result.micro_conversions      <span class="comment"># [budget_reveal, need_state
     </div>
 </footer>
 
+<script>
+    const API_BASE = window.location.origin;
+
+    async function subscribeToPlan(productId) {
+        // Get or create API key
+        let apiKey = localStorage.getItem('cy_api_key');
+        if (!apiKey) {
+            const email = prompt('Enter your email to get started:');
+            if (!email) return;
+            try {
+                const res = await fetch(`${API_BASE}/api/v1/keys`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, tier: 'free' }),
+                });
+                const data = await res.json();
+                apiKey = data.api_key;
+                localStorage.setItem('cy_api_key', apiKey);
+                localStorage.setItem('cy_server', API_BASE);
+            } catch (e) {
+                alert('Could not create account. Please try again.');
+                return;
+            }
+        }
+
+        // Create checkout session
+        try {
+            const res = await fetch(`${API_BASE}/api/v1/billing/checkout`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': apiKey,
+                },
+                body: JSON.stringify({ product_id: productId }),
+            });
+            const data = await res.json();
+            if (data.checkout_url) {
+                window.location.href = data.checkout_url;
+            } else {
+                alert(data.detail || 'Could not create checkout session.');
+            }
+        } catch (e) {
+            alert('Could not connect to billing. Please try again.');
+        }
+    }
+</script>
 </body>
 </html>

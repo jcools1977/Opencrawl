@@ -747,6 +747,32 @@
             </div>
         </div>
 
+        <!-- ── Billing & Subscription ──────────────────────────────── -->
+        <div class="card billing-card" style="grid-column: 1 / -1;">
+            <div class="card-header">
+                <span class="card-title">Billing & Subscription</span>
+                <span class="card-badge" id="billing-plan-badge">Free</span>
+            </div>
+            <div style="display: flex; gap: 32px; align-items: center; flex-wrap: wrap;">
+                <div>
+                    <div class="kpi-label">Current Plan</div>
+                    <div class="kpi-value green" id="billing-plan" style="font-size: 22px;">Free</div>
+                </div>
+                <div>
+                    <div class="kpi-label">Active Playbooks</div>
+                    <div class="kpi-value cyan" id="billing-playbooks" style="font-size: 22px;">0</div>
+                </div>
+                <div>
+                    <div class="kpi-label">Subscriptions</div>
+                    <div class="kpi-value blue" id="billing-subs-count" style="font-size: 22px;">0</div>
+                </div>
+                <div style="margin-left: auto; display: flex; gap: 12px;">
+                    <button class="btn btn-primary" onclick="upgradePlan()">Upgrade Plan</button>
+                    <button class="btn btn-ghost" onclick="manageBilling()">Manage Billing</button>
+                </div>
+            </div>
+        </div>
+
         <!-- ── Session Leaderboard ────────────────────────────────── -->
         <div class="card leaderboard-card">
             <div class="card-header">
@@ -846,6 +872,7 @@
         // ── Dashboard Loop ───────────────────────────────────────────
         function startDashboard() {
             refreshDashboard();
+            loadBillingInfo();
             if (refreshInterval) clearInterval(refreshInterval);
             refreshInterval = setInterval(refreshDashboard, 5000); // Refresh every 5s
         }
@@ -1002,6 +1029,66 @@
                     <div class="leader-yield" style="color: var(--accent-green)">$${(l.peak_yield || 0).toFixed(2)}</div>
                 </div>
             `).join('');
+        }
+
+        // ── Billing ──────────────────────────────────────────────────
+        async function loadBillingInfo() {
+            if (DEMO_MODE) {
+                document.getElementById('billing-plan').textContent = 'Pro';
+                document.getElementById('billing-plan-badge').textContent = 'PRO';
+                document.getElementById('billing-playbooks').textContent = '2';
+                document.getElementById('billing-subs-count').textContent = '3';
+                return;
+            }
+            try {
+                const data = await apiGet('/api/v1/billing/info');
+                const tier = (data.tier || 'free').charAt(0).toUpperCase() + (data.tier || 'free').slice(1);
+                document.getElementById('billing-plan').textContent = tier;
+                document.getElementById('billing-plan-badge').textContent = tier.toUpperCase();
+                document.getElementById('billing-playbooks').textContent = data.subscriptions
+                    ? data.subscriptions.filter(s => s.product_type === 'playbook').length : 0;
+                document.getElementById('billing-subs-count').textContent = data.active_subscriptions || 0;
+
+                // Update tier badge in topbar
+                const badge = document.getElementById('tier-badge');
+                badge.textContent = tier.toUpperCase();
+                badge.className = 'tier-badge tier-' + (data.tier || 'free');
+            } catch (e) {
+                console.error('Billing info error:', e);
+            }
+        }
+
+        async function upgradePlan() {
+            if (DEMO_MODE) { alert('Upgrade not available in demo mode.'); return; }
+            const plan = prompt('Enter plan to upgrade to (pro / enterprise):');
+            if (!plan || !['pro', 'enterprise'].includes(plan)) return;
+            try {
+                const res = await fetch(`${SERVER}/api/v1/billing/checkout`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+                    body: JSON.stringify({ product_id: plan }),
+                });
+                const data = await res.json();
+                if (data.checkout_url) window.location.href = data.checkout_url;
+                else alert(data.detail || 'Could not create checkout session.');
+            } catch (e) {
+                alert('Could not connect to billing.');
+            }
+        }
+
+        async function manageBilling() {
+            if (DEMO_MODE) { alert('Billing portal not available in demo mode.'); return; }
+            try {
+                const res = await fetch(`${SERVER}/api/v1/billing/portal`, {
+                    method: 'POST',
+                    headers: { 'X-API-Key': API_KEY },
+                });
+                const data = await res.json();
+                if (data.portal_url) window.location.href = data.portal_url;
+                else alert(data.detail || 'No billing account found. Subscribe first.');
+            } catch (e) {
+                alert('Could not open billing portal.');
+            }
         }
 
         // ── Demo Data ────────────────────────────────────────────────
