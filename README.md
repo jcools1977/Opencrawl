@@ -132,4 +132,4 @@ tests/
 
 ## License
 
-MIT — Use it, sell it, build on it. Every bot deserves to know what its conversations are worth.
+Proprietary — Copyright 2026 J. DeVere Cooley. All rights reserved.
